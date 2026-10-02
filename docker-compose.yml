@@ -1,0 +1,83 @@
+# IADSS → IBKR. Sequence Complete on /lb-buy and /lb-sell.
+# Do not run this at the same time as ptos-ibkr: both publish IB Gateway
+# paper port 4004 and the VNC ports. Leave that repo as-is for the
+# arm-then-trend flow; this stack replaces it when you want IADSS stocks.
+#
+# Cloudflare (existing Unraid tunnel, same Docker network as cloudflared):
+#   ibkr.ballzac.uk  →  HTTP  iadss-ibkr:5005
+# Path must be empty. Do not reuse the Kraken / IADSS-Signal-Tracker hostname.
+# Fallback if the tunnel cannot resolve container DNS:
+#   ibkr.ballzac.uk  →  HTTP  127.0.0.1:5006
+
+services:
+
+  # ── IB Gateway ────────────────────────────────────────────────────────────────
+  # Headless IBKR gateway — handles login and exposes the API on port 4004 (paper)
+  # or 4002 (live). VNC on 5900 for first-time setup / debugging.
+  # Image: https://github.com/gnzsnz/ib-gateway-docker
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: unless-stopped
+    environment:
+      TWS_USERID:       ${IBKR_USERNAME}
+      TWS_PASSWORD:     ${IBKR_PASSWORD}
+      TRADING_MODE:     ${TRADING_MODE:-paper}   # paper | live
+      TWS_ACCEPT_INCOMING: "yes"
+      # Auto-restart the session when IB Gateway logs out (~24h)
+      RELOGIN_AFTER_SECONDS: "3600"
+      # Enable VNC so you can complete 2FA login — connect on port 5901
+      VNC_SERVER_PASSWORD: ${VNC_PASSWORD:-ibkr_vnc}
+    ports:
+      - "4002:4002"   # Live API port  (unused when TRADING_MODE=paper)
+      - "4004:4004"   # Paper API port (unused when TRADING_MODE=live)
+      - "5901:5900"   # VNC raw — remapped from 5900 to avoid Krusader conflict
+      - "6080:6080"   # noVNC web UI — open http://UNRAID_IP:6080 in browser for 2FA login
+    volumes:
+      - ib-gateway-data:/root/IBGateway
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 4004 || nc -z localhost 4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5m   # Allow time for manual 2FA login via VNC before health check
+
+  # ── IADSS IBKR bot ────────────────────────────────────────────────────────────
+  iadss-ibkr:
+    build: .
+    container_name: iadss-ibkr
+    restart: unless-stopped
+    # Host port 5006 so a still-running ptos-ibkr on 5005 is not stolen.
+    # Cloudflare on the tunnel network should target iadss-ibkr:5005 directly.
+    ports:
+      - "127.0.0.1:5006:5005"
+    env_file:
+      - .env
+    environment:
+      IB_HOST: ib-gateway
+      IB_PORT: ${IB_PORT:-4004}   # Match TRADING_MODE: 4004=paper, 4002=live
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+    networks:
+      - backend
+      - tunnel_network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5005/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+volumes:
+  ib-gateway-data:
+
+networks:
+  backend:
+    name: iadss-ibkr-network
+  # Same Docker network as the existing cloudflared container (IADSS uses this).
+  # Override with DOCKER_NETWORK if the tunnel is not on `ballzac`.
+  tunnel_network:
+    name: ${DOCKER_NETWORK:-ballzac}
+    external: true
